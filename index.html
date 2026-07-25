@@ -287,6 +287,17 @@ async function sList(prefix, shared){
   if(HAS_ARTIFACT_STORE) return artifactList(prefix,true);
   return LS.keys(prefix);
 }
+async function sListValues(prefix, shared){
+  if(USE_CLOUD && shared){
+    try{
+      const r=await sbFetch("kv?select=key,value&key=like."+encodeURIComponent(prefix)+"*");
+      const out={}; (r||[]).forEach(function(x){ out[x.key]=x.value; }); return out;
+    }catch(e){ return {}; }
+  }
+  const out={};
+  for(const k of await sList(prefix, shared)){ const v=await sGet(k, shared); if(v!=null) out[k]=v; }
+  return out;
+}
 
 /* ---------------- app state ---------------- */
 const S = {
@@ -320,16 +331,28 @@ async function boot(){
   if(cat.note==null) cat.note="An item gets tossed only if nobody claims it. If you want something gone but it's not yours, leave it for the owner to decide.";
   S.catalog = cat;
   await loadShared();
+  await ensureMeInRoster();
   render();
 }
 
+async function ensureMeInRoster(){
+  if(!S.me) return;
+  await sSet("person:"+S.me.id, S.me, true);
+  const i = S.roster.findIndex(x=>x.id===S.me.id);
+  if(i>=0) S.roster[i].name=S.me.name; else S.roster.push({id:S.me.id, name:S.me.name});
+}
+
 async function loadShared(){
-  S.roster = (await sGet("roster", true)) || [];
-  // responses
-  const keys = await sList("resp:", true);
+  const respRaw = await sListValues("resp:", true);
   const resp = {};
-  for(const k of keys){ const v = await sGet(k, true); if(v){ resp[k.slice(5)] = v; } }
+  for(const k of Object.keys(respRaw)){ resp[k.slice(5)] = respRaw[k]; }
   S.responses = resp;
+  const peopleRaw = await sListValues("person:", true);
+  const roster = [];
+  for(const k of Object.keys(peopleRaw)){ const v=peopleRaw[k]; if(v&&v.id) roster.push({id:v.id, name:v.name}); }
+  // someone with answers but no person record still shows up — a response is never hidden
+  for(const id of Object.keys(resp)){ if(!roster.some(x=>x.id===id)) roster.push({id, name:null}); }
+  S.roster = roster;
   // custom photo images
   const imgs = {};
   for(const p of S.catalog.photos){
@@ -352,11 +375,9 @@ async function setName(name){
   const id = (S.me&&S.me.id) || uid("rm");
   S.me = {id, name};
   await sSet("me", S.me, false);
-  // upsert roster
-  let r = (await sGet("roster",true))||[];
-  const i = r.findIndex(x=>x.id===id);
-  if(i>=0) r[i].name=name; else r.push({id,name});
-  S.roster=r; await sSet("roster", r, true);
+  await sSet("person:"+id, S.me, true);
+  const i = S.roster.findIndex(x=>x.id===id);
+  if(i>=0) S.roster[i].name=name; else S.roster.push({id,name});
   if(!S.responses[id]) S.responses[id]={};
   S.view="photos"; render();
 }
@@ -570,29 +591,33 @@ function buildLedger(){
   for(const p of photos){
     for(const it of p.items){
       const owners=[];
-      for(const rm of S.roster){
-        const rr=(S.responses[rm.id]||{})[p.id];
+      for(const pid of Object.keys(S.responses)){
+        const rr=(S.responses[pid]||{})[p.id];
         if(rr && rr.owns==="yes" && rr.items && rr.items[it.id]!==undefined){
-          owners.push({name:rm.name, disp:rr.items[it.id]});
+          owners.push({name:nameFor(pid), disp:rr.items[it.id]});
         }
       }
       rows.push({photo:p, item:{name:it.name}, owners, custom:false});
     }
     // custom claimed items
-    for(const rm of S.roster){
-      const rr=(S.responses[rm.id]||{})[p.id];
+    for(const pid of Object.keys(S.responses)){
+      const rr=(S.responses[pid]||{})[p.id];
       if(rr && rr.custom){ rr.custom.forEach(c=>{
-        rows.push({photo:p, item:{name:c.label}, owners:[{name:rm.name,disp:c.disposition}], custom:true});
+        rows.push({photo:p, item:{name:c.label}, owners:[{name:nameFor(pid),disp:c.disposition}], custom:true});
       }); }
     }
   }
   return rows;
 }
+function nameFor(id){
+  const rm=S.roster.find(x=>x.id===id);
+  return (rm&&rm.name) ? rm.name : "Unnamed ("+String(id).slice(-4)+")";
+}
 function respondedIds(){
-  return new Set(S.roster.filter(rm=>{
-    const r=S.responses[rm.id]; if(!r) return false;
+  return new Set(Object.keys(S.responses).filter(id=>{
+    const r=S.responses[id]; if(!r) return false;
     return Object.values(r).some(x=>x && x.owns!=null);
-  }).map(rm=>rm.id));
+  }));
 }
 function summaryHTML(){
   const rows=buildLedger();
@@ -601,7 +626,7 @@ function summaryHTML(){
   const responded=respondedIds();
   const expected=S.catalog.expected||S.roster.length;
 
-  const rosterChips=S.roster.map(rm=>`<span class="chip ${responded.has(rm.id)?"":"pending"}">${responded.has(rm.id)?'<span class="tick">✓</span>':""}${esc(rm.name)}</span>`).join("") || `<span class="empty">No one has started yet.</span>`;
+  const rosterChips=S.roster.map(rm=>`<span class="chip ${responded.has(rm.id)?"":"pending"}">${responded.has(rm.id)?'<span class="tick">✓</span>':""}${esc(nameFor(rm.id))}</span>`).join("") || `<span class="empty">No one has started yet.</span>`;
 
   const filterBtns=`<div class="filters">
      <button data-f="all" aria-pressed="${S.filter==="all"}">All photos</button>
@@ -747,17 +772,18 @@ function wireManage(){
     try{
       const d=JSON.parse(document.getElementById("ioBox").value);
       if(d.catalog){ S.catalog=d.catalog; await sSet("catalog",S.catalog,true); }
-      if(d.roster){ S.roster=d.roster; await sSet("roster",S.roster,true); }
+      if(d.roster){ S.roster=d.roster; for(const rm of d.roster){ if(rm&&rm.id) await sSet("person:"+rm.id, {id:rm.id,name:rm.name}, true); } }
       if(d.responses){ for(const [id,val] of Object.entries(d.responses)){ S.responses[id]=val; await sSet("resp:"+id,val,true); } }
       toast("Imported"); render();
     }catch(e){ toast("Couldn't read that text"); }
   };
   document.getElementById("resetBtn").onclick=async()=>{
     if(!confirm("Reset ALL answers and round-2 photos for everyone? This can't be undone.")) return;
-    const keys=[...await sList("resp:",true), ...await sList("photoimg:",true)];
+    const keys=[...await sList("resp:",true), ...await sList("photoimg:",true), ...await sList("person:",true)];
     for(const k of keys) await sDel(k,true);
     await sDel("roster",true); await sDel("catalog",true);
-    S.responses={}; S.roster=S.me?[{id:S.me.id,name:S.me.name}]:[]; if(S.me) await sSet("roster",S.roster,true);
+    await sDel("me", false);
+    S.responses={}; S.roster=[]; S.me=null;
     S.catalog=JSON.parse(JSON.stringify(DEFAULT_CATALOG)); S.catalog.expected=7; S.catalog.note=DEFAULT_CATALOG.note; await sSet("catalog",S.catalog,true);
     S.images={}; toast("Reset done"); S.view="photos"; render();
   };
